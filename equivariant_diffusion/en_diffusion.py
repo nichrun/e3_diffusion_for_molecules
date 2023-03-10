@@ -726,6 +726,8 @@ class EnVariationalDiffusion(torch.nn.Module):
         eps_t = self.phi(zt, t, node_mask, edge_mask, context)
 
         # Compute mu for p(zs | zt).
+        """ These lines have been commented out!!!!!!!!!"""
+        #This may break everything
         diffusion_utils.assert_mean_zero_with_mask(zt[:, :, :self.n_dims], node_mask)
         diffusion_utils.assert_mean_zero_with_mask(eps_t[:, :, :self.n_dims], node_mask)
         mu = zt / alpha_t_given_s - (sigma2_t_given_s / alpha_t_given_s / sigma_t) * eps_t
@@ -758,39 +760,408 @@ class EnVariationalDiffusion(torch.nn.Module):
         return z
 
     @torch.no_grad()
-    def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False):
+    def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False, silvr_rate=0.01, ref_coords=None,ref_node_mask=None,shift_centre=True,dataset_info=None):
         """
         Draw samples from the generative model.
         """
+
+        #self.in_node_nf
+        #Additional column needs added to account for charge
+        #Either that, or the remaining reference coordinates have
+        #too many columns
+        
+
         if fix_noise:
             # Noise is broadcasted over the batch axis, useful for visualizations.
             z = self.sample_combined_position_feature_noise(1, n_nodes, node_mask)
         else:
             z = self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
+        #print("testing")
+        #print(z.size())
 
         diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
+        
 
+        from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
+    assert_correctly_masked, sample_center_gravity_zero_gaussian_with_mask
+        
+        data = np.asarray(ref_coords)
+        #hard coded
+        #I have removed self. from all other occurances
+        #self.atomic_number_list = torch.Tensor([5,  6,  7,  8,  9, 13, 14, 15, 16, 17, 33, 35, 53, 80, 83])[None, :]
+        #Due to previous hard coding this may break things
+        #The effect here is and additional 1 has been added to the beginning of the array/tensor
+        assert dataset_info
+        atomic_number_list = torch.Tensor(dataset_info["atomic_nb"])[None, :]
+        #print(atomic_number_list)
+        n_atom_types = atomic_number_list.size()[1]
+        #print(n_atom_types)
+        n = data.shape[0]
+
+        new_data = {}
+        new_data['positions'] = torch.from_numpy(data[:, -3:])
+        atom_types = torch.from_numpy(data[:, 0].astype(int)[:, None])
+        one_hot = atom_types == atomic_number_list
+        new_data['one_hot'] = one_hot
+        new_data['charges'] = torch.zeros(0,device=z.device)#, device=self.device
+        new_data['atom_mask'] = torch.ones(n,device=z.device)#, device=self.device
+
+        
+        #r_node_mask = new_data['atom_mask'].unsqueeze(2)#.to(device, dtype).unsqueeze(2)
+        #r_edge_mask = new_data['edge_mask']#.to(device, dtype)
+        #r_charges = (new_data['charges'] if args.include_charges else torch.zeros(0))#.to(device, dtype)
+        #r_charges = torch.zeros(0)#This is hard coded as 19 atoms
+        #r_charges = torch.zeros((19,1)).to(device=z.device)
+
+        r_x = new_data['positions'].to(device=z.device)#.to(device, dtype)
+        r_node_mask = torch.unsqueeze(torch.ones(n), 1).to(device=z.device)
+        r_one_hot = new_data['one_hot'].to(device=z.device)#.to(device, dtype)
+        r_charges = torch.zeros((n,1)).to(device=z.device)
+        r_h = {'categorical': r_one_hot, 'integer': r_charges}
+
+        """This should only need to be called once"""
+        #<start> was inside loop after sigma_t
+        # Concatenate x, h[integer] and h[categorical].
+        #Artifically increase tensor dimensions to 1,181,19
+
+        #Adding integer causes everything to break
+        #Don't know what do do here
+        #xh = torch.cat([r_x, r_h['categorical'], r_h['integer']], dim=1).to(device=z.device)#dim was 2
+        xh = torch.cat([r_x, r_h['categorical']], dim=1).to(device=z.device)#dim was 2
+        #This was previously hard coded as 19, now n_atom_types
+        #+3 for xyz coordinates and +1 for charge
+        xh = torch.cat([xh, torch.zeros(181-xh.shape[0], n_atom_types+3,device=z.device)], dim=0).to(device=z.device)
+        #making xh correct dimensions
+        xh = torch.unsqueeze(xh, 0).to(device=z.device)
+        
+        #Centering reference at zero
+        #"Error 32.199 too high"
+        #xh = diffusion_utils.remove_mean_with_mask(xh, node_mask2)
+
+        #Node mask without assertion
+
+        #Make this ref_node_mask - not great
+        #xh_xyz_only = xh.clone()
+        xh_xyz_only = xh[:, :, :3]
+        masked_max_abs_value = (xh_xyz_only * (1 - node_mask)).abs().sum().item()#node_mask2
+        N = node_mask.sum(1, keepdims=True)#node_mask2
+        mean = torch.sum(xh_xyz_only, dim=1, keepdim=True) / N
+
+        number_of_zeroes = xh.size()[2]-3#Probably a better place to find this 
+        zero_padding_tensor = torch.zeros(1, 1, number_of_zeroes).to(device=z.device)
+        mean  = torch.cat([mean, zero_padding_tensor], dim=2)
+
+        total_gravity_center_shift = mean
+
+        xh = xh - mean * node_mask#node_mask2
+
+        #diffusion_utils.assert_mean_zero_with_mask(xh[:, :, :self.n_dims], node_mask2)
+        #Error: Not masked properly?
+        #<end> was inside loop after sigma_t
+
+        #This was also inside loop
+        # Sample zt ~ Normal(alpha_t x, sigma_t)
+        #self.n_dims = 19?
+        
+        # Sample z_t given x, h for timestep t, from q(z_t | x, h)
+
+        ref_nodes = torch.sum(ref_node_mask)
+        nodes = torch.sum(node_mask)
+        if nodes != ref_nodes:
+          #outpaint_factor = ref_nodes / (nodes-ref_nodes)
+          outpaint_factor = nodes / (nodes-ref_nodes)
+        else:
+          outpaint_factor = 1
+
+        #print(outpaint_factor)
+        #print(torch.sum(node_mask)-torch.sum(ref_node_mask))
+        #print(torch.sum(ref_node_mask))
+
+        dummy_mask = node_mask - ref_node_mask
+
+        animation = False
+        animation_array = []#Animation
+
+        if animation:
+          import pickle
+          with open("/content/e3_diffusion_for_molecules/outputs/mask.txt", "wb") as writefile:
+              pickle.dump(node_mask, writefile)
+              print("Pickle File Dumped")
+
+        
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
         for s in reversed(range(0, self.T)):
+            if (s)%100==0:
+              pass
+              #print("sample loop: ", s+1)
+              #print(total_gravity_center_shift)
+
             s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
             t_array = s_array + 1
             s_array = s_array / self.T
             t_array = t_array / self.T
 
+            #ILVR variables
+            # Compute gamma_s and gamma_t via the network.
+            gamma_s = self.inflate_batch_array(self.gamma(s_array), r_x).to(device=z.device)#was s
+            gamma_t = self.inflate_batch_array(self.gamma(t_array), r_x).to(device=z.device)#was t
+            alpha_t = self.alpha(gamma_t, r_x).to(device=z.device)
+            sigma_t = self.sigma(gamma_t, r_x).to(device=z.device)
+
+            #Animation section
+            if animation:
+              total_gravity_center_shift = total_gravity_center_shift.type(z.dtype)
+              #Centre of gravity also takes into account atom type (for some reason)
+              #This might be a big
+              #Consider fixing
+              total_gravity_center_shift[:, :, 3:] = 0
+              z_in = z + total_gravity_center_shift*node_mask#node_mask2
+
+              animation_array.append(self.sample_p_xh_given_z0(z_in, node_mask, edge_mask, context, fix_noise=fix_noise))
+            ##############
+
+
+            #---------Gravity Alignments--------
+            #---------centering z------
+            z_xyz_only = z[:, :, :3]
+            N = node_mask.sum(1, keepdims=True)#node_mask2
+            mean = torch.sum(z_xyz_only, dim=1, keepdim=True) / N
+            mean  = torch.cat([mean, zero_padding_tensor], dim=2)
+            z = z - mean*node_mask#node_mask2
+
+            #---------centering xh------
+            #Method 1
+            #Considering dummy atoms
+            
+            xh = xh*ref_node_mask + z*(ref_node_mask - node_mask)
+            xh_xyz_only = xh[:, :, :3]
+            N = node_mask.sum(1, keepdims=True)#node_mask2
+            mean = torch.sum(xh_xyz_only, dim=1, keepdim=True) / N
+            mean  = torch.cat([mean, zero_padding_tensor], dim=2)
+            xh = xh - mean*ref_node_mask#node_mask2
+            
+
+            #---------centering xh------
+            #Method 2
+            #as a function of z mean using "outpain factor"
+            #mean *= outpaint_factor
+            #xh = xh - mean*ref_node_mask#1.5 is good. and 40/9. 31/9
+
+            #-------Correction factor to reference--------
+            #When reference coordinates are translated
+            #Update this variable to allow product molecule to
+            #Be translated to binding site
+            total_gravity_center_shift += mean#*(outpaint_factor)#was minus
+
+
+            #--supressing one hot seemed to help previously--
+            #z_hot_only = z[:, :, 3:]
+            #N = node_mask.sum(1, keepdims=True)#node_mask2
+            #mean = torch.sum(z_hot_only, dim=1, keepdim=True) / N
+            #mean  = torch.cat([zero_padding_tensor[:,:,:3], mean], dim=2)
+            #z = z - mean*node_mask
+
+            #--------Diffusion-----------
+            #sample reverse diffusion
+            #z must be centered at zero
             z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context, fix_noise=fix_noise)
+            
+            #----------SILVR----------
+            #was n_samples=1
+            eps = self.sample_combined_position_feature_noise(n_samples=n_samples,n_nodes=181, node_mask=node_mask).to(device=z.device)#node_mask2
+            z_t = alpha_t * xh + sigma_t * eps
+            z_t = z_t.to(torch.float32).to(device=z.device)
+
+            #SILVR equation
+            z = z - (z*alpha_t*ref_node_mask)*silvr_rate + (z_t*ref_node_mask)*silvr_rate#node_mask2
+
+            #Fix Atom ID
+            #fix_atom_id_mask = None
+            #z = z*(1-fix_atom_id_mask)
+
+            
+
+
+
+            #-----------comments only------------
+
+            #This line is only used to determine if an explosion has occured
+            #Used in centering at zero
+            #masked_max_abs_value = (z_xyz_only * (1 - node_mask)).abs().sum().item()#node_mask2
+
+
+            #Error too high
+            """
+            z_t = torch.cat(
+            [diffusion_utils.remove_mean_with_mask(z_t[:, :, :self.n_dims],
+                                                   node_mask2),
+             z_t[:, :, self.n_dims:]], dim=2)
+            """
+
+            #All were z_t
+            #Combine dummy atoms to z_t
+
+            """
+            masked_max_abs_value = (z_t * (1 - node_mask)).abs().sum().item()#node_mask2
+            N = node_mask.sum(1, keepdims=True)#node_mask2
+            mean = torch.sum(z_t, dim=1, keepdim=True) / N
+            total_gravity_center_shift -= mean
+            z_t = z_t - mean * node_mask#node_mask2
+            """
+
+            
+            #Note: mean seems to consider atom identity
+            #and coordinates.
+            #Consider only modifying xyz
+            #Note: Cloning is likely slow
+            #This is still wrong. The center of mass is now taking
+            #16 columns as 0
+            #Calculate centre of mass with only first 3 columns
+            #z_xyz_only = z.clone()
+            #z_xyz_only[:, :, 3:] = 0
+            
+
+            #print(z_xyz_only.size())
+            #print(z.size())
+
+            #----EDITED--------
+            #used to be z
+            #now z_xyz_only
+            
+
+            #produced molecules seemed better when the mean
+            #Was subtracted accross the entire tensor
+            #and not just atom coordinates
+            #Maybe keep one hot low
+            
+
+            #Works
+            
+
+            #Only updating xyz
+            #Not as good
+            #z[:, :, :3] = z[:, :, :3] - mean[:, :, :3]*node_mask#node_mask2
+
+            
+
+            #!!!!!! I have no idea why this line works
+            #After lots of trial and error I have found multiplying
+            #by a factor > 1 allows for singular molecules to be formed
+            #Only for outpainting
+            #This ratio could be related to levers and fulcrim
+
+
+
+            #Better molecule is produced when there is no xh correction
+            #However for outpainting it seems this is needed
+            #Consider xh correction only for dummy atoms?
+
+            #dummy_mask
+            #This might be lever rule
+            #Correction with outpaint_factor may bring fragment
+            #towards centre point of balance
+            #Hence having the effect of combining fragments together
+            
+
+            #Error too high
+            """
+            z = torch.cat(
+            [diffusion_utils.remove_mean_with_mask(z[:, :, :self.n_dims],
+                                                   node_mask),
+             z[:, :, self.n_dims:]], dim=2)
+            """
+            #----set xh additional atoms to that of the live z----
+            #additional_atom_mask = (node_mask - ref_node_mask)
+            #xh = xh*(1-additional_atom_mask) + z*additional_atom_mask#Who knows
+            
+        #By tracking all the gravity shifts it should be
+        #possible to directly obtain the coordinated
+        #of the generated molecule in the save coordinate
+        #as the reference protein
+        if shift_centre:
+          #print("shifting centre")
+          #Only works when ref = no.mols
+          total_gravity_center_shift = total_gravity_center_shift.type(z.dtype)
+          #Centre of gravity also takes into account atom type (for some reason)
+          #This might be a big
+          #Consider fixing
+          total_gravity_center_shift[:, :, 3:] = 0
+          z = z + total_gravity_center_shift*node_mask#node_mask2
+
 
         # Finally sample p(x, h | z_0).
         x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
 
-        diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
 
+        ####Animation
+        if animation:
+          animation_array.append(self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise))
+          #animation_array.append(z_t*node_mask2)
+          #Final entry in animation array is the reference molecule - note nodemask2 is needed
+          #As z_t contains a dummy atom to account for centre of mass issue
+          import pickle
+
+          with open("/content/e3_diffusion_for_molecules/outputs/animation.txt", "wb") as writefile:
+            pickle.dump(animation_array, writefile)
+            print("Pickle File Dumped")
+        #######
+        #These lines fixed center of gravity
+        #commented out while experimenting 
+
+        #Line has been commented out
+        #This may break things
+        #diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
+        #I believe this centres the molecule at 0
+        #However we want the actual coordinates wrt protein
+        #and so I have delted the drifting correction
+        """
         max_cog = torch.sum(x, dim=1, keepdim=True).abs().max().item()
         if max_cog > 5e-2:
             print(f'Warning cog drift with error {max_cog:.3f}. Projecting '
                   f'the positions down.')
             x = diffusion_utils.remove_mean_with_mask(x, node_mask)
+        """
 
         return x, h
+
+    
+    @torch.no_grad()
+    def q_sample(self, x_start, t, noise=None):
+        """
+        Diffuse the data for a given number of diffusion steps.
+        In other words, sample from q(x_t | x_0).
+        :param x_start: the initial data batch.
+        :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
+        :param noise: if specified, the split-out normal noise.
+        :return: A noisy version of x_start.
+        """
+        if noise is None:
+            noise = th.randn_like(x_start)
+        assert noise.shape == x_start.shape
+        return (
+            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+            * noise
+        )
+
+
+    @torch.no_grad()
+    def _extract_into_tensor(arr, timesteps, broadcast_shape):
+        """
+        Extract values from a 1-D numpy array for a batch of indices.
+        :param arr: the 1-D numpy array.
+        :param timesteps: a tensor of indices into the array to extract.
+        :param broadcast_shape: a larger shape of K dimensions with the batch
+                                dimension equal to the length of timesteps.
+        :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+        """
+        res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+        while len(res.shape) < len(broadcast_shape):
+            res = res[..., None]
+        return res.expand(broadcast_shape)
+
+
+#------------------End of new code--------------------------
 
     @torch.no_grad()
     def sample_chain(self, n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=None):
